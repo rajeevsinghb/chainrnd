@@ -1,5 +1,4 @@
 name: Run chainrnd
-
 on:
   workflow_dispatch:
     inputs:
@@ -29,19 +28,19 @@ on:
         required: false
         default: ""
 
+permissions:
+  contents: write   # <-- required so github-actions[bot] can push commits back to the repo
+
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Build command flags
         id: flags
         run: |
@@ -59,7 +58,6 @@ jobs:
             FLAGS="$FLAGS --to-date ${{ inputs.to_date }}"
           fi
           echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
-
       - name: Run
         env:
           EXPLORER_API_KEY: ${{ secrets.EXPLORER_API_KEY }}
@@ -67,7 +65,6 @@ jobs:
         run: |
           cd src
           python run.py --chain ${{ inputs.chain }} --contract ${{ inputs.contract }} ${{ steps.flags.outputs.flags }}
-
       - name: Commit updated data + results back to repo
         run: |
           git config user.name "github-actions[bot]"
