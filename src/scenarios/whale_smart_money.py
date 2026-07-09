@@ -19,6 +19,9 @@ from config import settings
 
 SCENARIO_NAME = "whale_smart_money"
 
+PNL_COLUMNS = ["wallet", "realized_pnl_usd", "total_bought", "total_sold", "net_position"]
+EXTRA_COLUMNS = ["wallet", "timing_score", "funding_source"]
+
 
 def _detect_exchange_addresses(df: pd.DataFrame, chain: str) -> set:
     known = set(settings.known_exchange_addresses)
@@ -41,7 +44,7 @@ def _detect_exchange_addresses(df: pd.DataFrame, chain: str) -> set:
 
 def _realized_pnl(df: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
     if prices.empty:
-        return pd.DataFrame(columns=["wallet", "realized_pnl_usd", "total_bought", "total_sold", "net_position"])
+        return pd.DataFrame(columns=PNL_COLUMNS)
 
     price_map = dict(zip(prices["date"], prices["price_usd"]))
     df = df.copy()
@@ -83,7 +86,12 @@ def _realized_pnl(df: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
             "total_sold": total_sold,
             "net_position": total_bought - total_sold,
         })
-    return pd.DataFrame(results)
+
+    # NOTE: pd.DataFrame([]) with an empty list produces a DataFrame with
+    # NO columns at all, which later breaks `pnl_df["wallet"]` / merges.
+    # Always pin the columns explicitly so downstream code sees a
+    # consistent (possibly 0-row) schema even when `wallets` is empty.
+    return pd.DataFrame(results, columns=PNL_COLUMNS)
 
 
 def _funding_source(wallet: str, chain: str) -> str:
@@ -102,8 +110,7 @@ def _funding_source(wallet: str, chain: str) -> str:
 def _accumulation_timing_score(wallet_buys: pd.DataFrame, prices: pd.DataFrame) -> float:
     if wallet_buys.empty or prices.empty:
         return 0.0
-    price_map = dict(zip(prices["date"], prices["price_usd"]))
-    prices_sorted = prices.sort_values("date")
+    prices_sorted = prices.sort_values("date").copy()
     prices_sorted["pct_change"] = prices_sorted["price_usd"].pct_change().abs()
     vol_map = dict(zip(prices_sorted["date"], prices_sorted["pct_change"]))
 
@@ -121,8 +128,10 @@ def _accumulation_timing_score(wallet_buys: pd.DataFrame, prices: pd.DataFrame) 
 
 
 def _coordinated_and_fresh_flags(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["wallet", "flagged_coordinated", "flagged_fresh_big_buy"])
+
     df = df.sort_values("datetime")
-    window = pd.Timedelta(minutes=settings.coordinated_window_minutes)
     coordinated_wallets = set()
 
     buys = df.copy()
@@ -132,7 +141,6 @@ def _coordinated_and_fresh_flags(df: pd.DataFrame) -> pd.DataFrame:
     for b in hot_buckets:
         coordinated_wallets.update(buys[buys["bucket"] == b]["to"].unique())
 
-    first_seen = df.groupby("to")["datetime"].min()
     first_buy_amount = df.sort_values("datetime").groupby("to").first()["value_token"]
     fresh_big_buy = set(first_buy_amount[first_buy_amount >= settings.fresh_wallet_buy_threshold].index)
 
@@ -154,6 +162,15 @@ def run(df: pd.DataFrame, prices: pd.DataFrame, chain: str = "ethereum", **kwarg
     pnl_df = _realized_pnl(df_filtered, prices)
     flags_df = _coordinated_and_fresh_flags(df_filtered)
 
+    if pnl_df.empty:
+        # Nothing survived the exchange filter / no priced transfers —
+        # return an empty, correctly-shaped result instead of crashing.
+        return pd.DataFrame(columns=[
+            "wallet", "smart_money_score", "realized_pnl_usd", "total_bought", "total_sold",
+            "net_position", "distinct_tokens_traded", "timing_score", "funding_source",
+            "in_funding_cluster", "cluster_size", "flagged_coordinated", "flagged_fresh_big_buy",
+        ])
+
     rows = []
     top_candidates = pnl_df.sort_values("net_position", ascending=False).head(
         settings.top_n_wallets_deep_analysis
@@ -164,7 +181,11 @@ def run(df: pd.DataFrame, prices: pd.DataFrame, chain: str = "ethereum", **kwarg
         timing_score = _accumulation_timing_score(buys, prices) if w in top_candidates else 0.0
         funding = _funding_source(w, chain) if w in top_candidates else "not_analyzed"
         rows.append({"wallet": w, "timing_score": timing_score, "funding_source": funding})
-    extra_df = pd.DataFrame(rows)
+
+    # Same fix as _realized_pnl: pin columns so an empty `rows` list still
+    # produces a DataFrame with a "wallet" column, so the merge below
+    # never raises KeyError: 'wallet'.
+    extra_df = pd.DataFrame(rows, columns=EXTRA_COLUMNS)
 
     result = pnl_df.merge(extra_df, on="wallet", how="left").merge(flags_df, on="wallet", how="left")
     result["flagged_coordinated"] = result["flagged_coordinated"].fillna(False)
@@ -195,6 +216,7 @@ def run(df: pd.DataFrame, prices: pd.DataFrame, chain: str = "ethereum", **kwarg
     def _norm(s):
         rng = s.max() - s.min()
         return (s - s.min()) / rng if rng else s * 0
+
     pnl_norm = _norm(result["realized_pnl_usd"].clip(lower=0))
     accum_norm = _norm(result["net_position"].clip(lower=0))
     diversity_norm = _norm(result["distinct_tokens_traded"])
@@ -209,7 +231,7 @@ def run(df: pd.DataFrame, prices: pd.DataFrame, chain: str = "ethereum", **kwarg
         + settings.weight_coordinated_fresh * coord_fresh_norm
     ).round(4)
 
-    result = result[result["value" if False else "net_position"].notna()]
+    result = result[result["net_position"].notna()]
     result = result[result["net_position"] >= settings.whale_threshold_tokens / 10]  # keep meaningfully-sized wallets
     result = result.sort_values("smart_money_score", ascending=False).reset_index(drop=True)
 
