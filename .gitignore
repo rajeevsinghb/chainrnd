@@ -1,0 +1,17 @@
+# Secrets — never commit
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+
+# NOTE: data/raw, data/cache and output/ are intentionally NOT
+# ignored — this project stores its parquet raw-data cache and CSV
+# results inside the repo on purpose, so GitHub Actions runs persist
+# and re-runs don't have to refetch. See README.md.
