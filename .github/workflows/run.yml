@@ -1,0 +1,77 @@
+name: Run chainrnd
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "fetch | scenario | both"
+        required: true
+        default: "both"
+        type: choice
+        options: [fetch, scenario, both]
+      chain:
+        description: "Chain (ethereum | bsc | polygon | arbitrum)"
+        required: true
+        default: "ethereum"
+      contract:
+        description: "Token contract address"
+        required: true
+      scenario:
+        description: "Comma-separated scenario name(s)"
+        required: false
+        default: "whale_smart_money,exchange_flow"
+      from_date:
+        description: "Optional start date YYYY-MM-DD"
+        required: false
+        default: ""
+      to_date:
+        description: "Optional end date YYYY-MM-DD"
+        required: false
+        default: ""
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build command flags
+        id: flags
+        run: |
+          FLAGS=""
+          if [ "${{ inputs.mode }}" = "fetch" ] || [ "${{ inputs.mode }}" = "both" ]; then
+            FLAGS="$FLAGS --fetch"
+          fi
+          if [ "${{ inputs.mode }}" = "scenario" ] || [ "${{ inputs.mode }}" = "both" ]; then
+            FLAGS="$FLAGS --scenario ${{ inputs.scenario }}"
+          fi
+          if [ -n "${{ inputs.from_date }}" ]; then
+            FLAGS="$FLAGS --from-date ${{ inputs.from_date }}"
+          fi
+          if [ -n "${{ inputs.to_date }}" ]; then
+            FLAGS="$FLAGS --to-date ${{ inputs.to_date }}"
+          fi
+          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
+
+      - name: Run
+        env:
+          EXPLORER_API_KEY: ${{ secrets.EXPLORER_API_KEY }}
+          KNOWN_EXCHANGE_ADDRESSES: ${{ vars.KNOWN_EXCHANGE_ADDRESSES }}
+        run: |
+          cd src
+          python run.py --chain ${{ inputs.chain }} --contract ${{ inputs.contract }} ${{ steps.flags.outputs.flags }}
+
+      - name: Commit updated data + results back to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/raw data/cache output
+          git diff --cached --quiet || git commit -m "Automated run: ${{ inputs.mode }} ${{ inputs.chain }}/${{ inputs.contract }}"
+          git push
