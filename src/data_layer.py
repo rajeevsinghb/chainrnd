@@ -8,6 +8,7 @@ scenarios" possible.
 """
 
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -346,29 +347,71 @@ def fetch_prices(
 
     platform = settings.coingecko_platform(chain)
 
-    url = (
+    headers = {}
+    api_key = os.getenv("COINGECKO_API_KEY", "")
+    if api_key:
+        # Demo-plan keys use this header; raises the rate limit from
+        # ~5-15 calls/min (keyless, IP-shared — easily exhausted on
+        # GitHub Actions runners, which share IPs across many users)
+        # to a stable 30 calls/min.
+        headers["x-cg-demo-api-key"] = api_key
+
+    def _get(url, params):
+        """GET with retry-with-backoff on 429 (rate limit) / 5xx.
+        Returns the final response (may still be non-200)."""
+        last_resp = None
+        for attempt in range(4):
+            resp = requests.get(url, params=params, headers=headers, timeout=30)
+            last_resp = resp
+            if resp.status_code == 200:
+                return resp
+            if resp.status_code == 429 or resp.status_code >= 500:
+                time.sleep(2 ** attempt)  # 1s, 2s, 4s, 8s
+                continue
+            break  # non-retryable (e.g. 404) — no point retrying
+        return last_resp
+
+    contract_url = (
         f"https://api.coingecko.com/api/v3/coins/"
         f"{platform}/contract/{contract}/market_chart"
     )
+    params = {"vs_currency": "usd", "days": "max", "interval": "daily"}
 
-    resp = requests.get(
-        url,
-        params={
-            "vs_currency": "usd",
-            "days": "max",
-            "interval": "daily",
-        },
-        timeout=30,
-    )
+    resp = _get(contract_url, params)
 
-    if resp.status_code != 200:
-        return existing
+    if resp is None or resp.status_code != 200:
+        status = resp.status_code if resp is not None else "no response"
+        print(
+            f"[price-fetch] WARNING: contract-lookup failed for "
+            f"{chain}/{contract} (HTTP {status}). "
+            f"Common causes: (1) CoinGecko rate-limit on keyless/shared-IP "
+            f"requests (set COINGECKO_API_KEY in .env / GitHub secret to "
+            f"fix), or (2) this token migrated/rebranded to a new contract "
+            f"and CoinGecko hasn't mapped it yet — set COINGECKO_COIN_ID in "
+            f".env to fetch by coin id instead. Falling back to any "
+            f"previously-cached price data ({len(existing)} rows)."
+        )
+        # Fallback: fetch by coin id if one was given (handles rebrand/
+        # migration cases where the contract-address lookup 404s but the
+        # coin itself is listed under a stable id, e.g. "anyone-protocol")
+        fallback_id = coin_id or os.getenv("COINGECKO_COIN_ID", "")
+        if fallback_id:
+            id_url = f"https://api.coingecko.com/api/v3/coins/{fallback_id}/market_chart"
+            resp = _get(id_url, params)
+            if resp is None or resp.status_code != 200:
+                status = resp.status_code if resp is not None else "no response"
+                print(f"[price-fetch] WARNING: coin-id fallback '{fallback_id}' also failed (HTTP {status}).")
+                return existing
+            print(f"[price-fetch] coin-id fallback '{fallback_id}' succeeded.")
+        else:
+            return existing
 
     data = resp.json()
 
     prices = data.get("prices", [])
 
     if not prices:
+        print(f"[price-fetch] WARNING: CoinGecko returned HTTP 200 but no price points for {chain}/{contract}.")
         return existing
 
     new_df = pd.DataFrame(
@@ -392,6 +435,7 @@ def fetch_prices(
     )
 
     combined.to_parquet(out_path, index=False)
+    print(f"[price-fetch] OK — {len(combined)} daily price rows cached for {chain}/{contract}.")
 
     return combined
 
