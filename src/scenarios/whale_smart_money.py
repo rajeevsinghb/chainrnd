@@ -49,7 +49,7 @@ def _realized_pnl(df: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
     price_map = dict(zip(prices["date"], prices["price_usd"]))
     df = df.copy()
     df["date"] = df["datetime"].dt.date.astype(str)
-    df["price"] = df["date"].map(price_map).fillna(method="ffill")
+    df["price"] = df["date"].map(price_map).ffill()
 
     wallets = pd.unique(pd.concat([df["from"], df["to"]]))
     results = []
