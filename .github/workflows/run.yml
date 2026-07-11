@@ -62,6 +62,8 @@ jobs:
         env:
           EXPLORER_API_KEY: ${{ secrets.EXPLORER_API_KEY }}
           KNOWN_EXCHANGE_ADDRESSES: ${{ vars.KNOWN_EXCHANGE_ADDRESSES }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          COINGECKO_COIN_ID: ${{ vars.COINGECKO_COIN_ID }}
         run: |
           cd src
           python run.py --chain ${{ inputs.chain }} --contract ${{ inputs.contract }} ${{ steps.flags.outputs.flags }}
