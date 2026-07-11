@@ -157,7 +157,17 @@ def run(df: pd.DataFrame, prices: pd.DataFrame, chain: str = "ethereum", **kwarg
         return pd.DataFrame()
 
     exchange_addrs = _detect_exchange_addresses(df, chain)
-    df_filtered = df[~df["to"].isin(exchange_addrs) & ~df["from"].isin(exchange_addrs)]
+
+    # IMPORTANT: do NOT drop rows involving exchange_addrs here.
+    # For DEX-traded tokens (Uniswap etc.), almost every buy/sell shows up
+    # as a transfer to/from the liquidity-pool address — that transfer IS
+    # the trade. Dropping those rows removes the actual buy/sell signal
+    # entirely and leaves nothing to score (this was the root cause of
+    # whale_smart_money returning 0 rows for pool-traded tokens).
+    # Exchange/pool addresses are excluded later, only from the final
+    # ranked wallet list — so the pool never shows up as a "whale wallet"
+    # itself, but every real wallet's trades through it are still counted.
+    df_filtered = df
 
     pnl_df = _realized_pnl(df_filtered, prices)
     flags_df = _coordinated_and_fresh_flags(df_filtered)
@@ -232,6 +242,7 @@ def run(df: pd.DataFrame, prices: pd.DataFrame, chain: str = "ethereum", **kwarg
     ).round(4)
 
     result = result[result["net_position"].notna()]
+    result = result[~result["wallet"].isin(exchange_addrs)]  # pool/exchange itself shouldn't be ranked as a "wallet"
     result = result[result["net_position"] >= settings.whale_threshold_tokens / 10]  # keep meaningfully-sized wallets
     result = result.sort_values("smart_money_score", ascending=False).reset_index(drop=True)
 
