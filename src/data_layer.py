@@ -166,16 +166,30 @@ def fetch_transfers(
     page = 1
     offset = 10000
 
+    # Etherscan (and BscScan/PolygonScan/Arbiscan) enforce a hard limit:
+    # page * offset must stay <= 10000. Going past it doesn't return an
+    # empty list — it returns an error payload (result is a string, not
+    # a list), which used to be silently treated as "no more data" and
+    # capped every fetch at exactly 10,000 rows total.
+    #
+    # Fix: once a page comes back FULL (== offset rows) and the NEXT
+    # page would cross that 10,000 ceiling, don't increment the page —
+    # instead re-anchor startblock to (last block seen + 1) and reset
+    # page back to 1. This walks forward in successive <=10k windows,
+    # so total history of any size can be fetched, not just the first 10k.
+    current_from_block = from_block
     max_block_seen = from_block - 1 if from_block > 0 else 0
+    windows_fetched = 0
+    MAX_WINDOWS = 2000  # safety valve (covers up to ~20M transfers)
 
     while True:
 
         params = {
-            "chainid": settings.chain_id(chain),      # <-- Added
+            "chainid": settings.chain_id(chain),
             "module": "account",
             "action": "tokentx",
             "contractaddress": contract,
-            "startblock": from_block,
+            "startblock": current_from_block,
             "endblock": to_block,
             "page": page,
             "offset": offset,
@@ -193,19 +207,24 @@ def fetch_transfers(
 
         all_rows.extend(rows)
 
-        max_block_seen = max(
-            max_block_seen,
-            int(rows[-1]["blockNumber"])
-        )
+        last_block_in_page = int(rows[-1]["blockNumber"])
+        max_block_seen = max(max_block_seen, last_block_in_page)
 
         if len(rows) < offset:
+            # partial page = genuinely reached the end of available data
             break
 
-        page += 1
+        if (page + 1) * offset > 10000:
+            # would cross Etherscan's page*offset cap — re-anchor instead
+            current_from_block = last_block_in_page + 1
+            page = 1
+        else:
+            page += 1
 
+        windows_fetched += 1
         time.sleep(REQUEST_PAUSE_SECONDS)
 
-        if page > 500:
+        if windows_fetched > MAX_WINDOWS:
             break
 
     new_df = pd.DataFrame(all_rows)
