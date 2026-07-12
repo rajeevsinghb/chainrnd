@@ -136,7 +136,7 @@ def main():
         for name in [s.strip() for s in args.scenario.split(",") if s.strip()]:
             module = scenario_registry.get_scenario(name)
             print(f"[scenario] running '{name}' ...")
-            result = module.run(df, prices, chain=args.chain)
+            result = module.run(df, prices, chain=args.chain, contract=args.contract)
             if result is None or result.empty:
                 print(f"  (no output rows for '{name}')")
                 continue
