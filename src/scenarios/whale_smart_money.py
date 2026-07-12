@@ -47,7 +47,7 @@ def _realized_pnl(df: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=PNL_COLUMNS)
 
     price_map = dict(zip(prices["date"], prices["price_usd"]))
-    df = df.copy()
+    df = df.copy().sort_values("datetime")
     df["date"] = df["datetime"].dt.date.astype(str)
     df["price"] = df["date"].map(price_map).ffill()
 
