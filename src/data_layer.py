@@ -377,7 +377,10 @@ def fetch_prices(
         f"https://api.coingecko.com/api/v3/coins/"
         f"{platform}/contract/{contract}/market_chart"
     )
-    params = {"vs_currency": "usd", "days": "max", "interval": "daily"}
+    # CoinGecko's free/Demo plan caps historical lookback at 365 days
+    # (days="max" is Pro-only and returns error_code 10012 "exceeds the
+    # allowed time range" on Demo/keyless requests).
+    params = {"vs_currency": "usd", "days": "365", "interval": "daily"}
 
     resp = _get(contract_url, params)
 
