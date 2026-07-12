@@ -9,16 +9,29 @@ on:
         type: choice
         options: [fetch, scenario, both]
       chain:
-        description: "Chain (ethereum | bsc | polygon | arbitrum)"
+        description: "Chain"
         required: true
         default: "ethereum"
+        type: choice
+        options: [ethereum, bsc, polygon, arbitrum]
       contract:
         description: "Token contract address"
         required: true
-      scenario:
-        description: "Comma-separated scenario name(s)"
+      run_whale_smart_money:
+        description: "Run scenario: whale_smart_money"
         required: false
-        default: "whale_smart_money,exchange_flow"
+        default: true
+        type: boolean
+      run_exchange_flow:
+        description: "Run scenario: exchange_flow"
+        required: false
+        default: true
+        type: boolean
+      run_summary_report:
+        description: "Run scenario: summary_report (combined Markdown + charts)"
+        required: false
+        default: true
+        type: boolean
       from_date:
         description: "Optional start date YYYY-MM-DD"
         required: false
@@ -49,7 +62,19 @@ jobs:
             FLAGS="$FLAGS --fetch"
           fi
           if [ "${{ inputs.mode }}" = "scenario" ] || [ "${{ inputs.mode }}" = "both" ]; then
-            FLAGS="$FLAGS --scenario ${{ inputs.scenario }}"
+            SCENARIOS=""
+            if [ "${{ inputs.run_whale_smart_money }}" = "true" ]; then
+              SCENARIOS="whale_smart_money"
+            fi
+            if [ "${{ inputs.run_exchange_flow }}" = "true" ]; then
+              if [ -n "$SCENARIOS" ]; then SCENARIOS="$SCENARIOS,exchange_flow"; else SCENARIOS="exchange_flow"; fi
+            fi
+            if [ "${{ inputs.run_summary_report }}" = "true" ]; then
+              if [ -n "$SCENARIOS" ]; then SCENARIOS="$SCENARIOS,summary_report"; else SCENARIOS="summary_report"; fi
+            fi
+            if [ -n "$SCENARIOS" ]; then
+              FLAGS="$FLAGS --scenario $SCENARIOS"
+            fi
           fi
           if [ -n "${{ inputs.from_date }}" ]; then
             FLAGS="$FLAGS --from-date ${{ inputs.from_date }}"
