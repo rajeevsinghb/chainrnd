@@ -51,47 +51,60 @@ def _realized_pnl(df: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
     df["date"] = df["datetime"].dt.date.astype(str)
     df["price"] = df["date"].map(price_map).ffill()
 
-    wallets = pd.unique(pd.concat([df["from"], df["to"]]))
-    results = []
-    for w in wallets:
-        buys = df[df["to"] == w].sort_values("datetime")
-        sells = df[df["from"] == w].sort_values("datetime")
-        total_bought = buys["value_token"].sum()
-        total_sold = sells["value_token"].sum()
+    # --- Vectorized totals (fast, O(n)) instead of per-wallet filtering ---
+    bought_totals = df.groupby("to")["value_token"].sum()
+    sold_totals = df.groupby("from")["value_token"].sum()
+    all_wallets = pd.unique(pd.concat([df["from"], df["to"]]))
+    totals = pd.DataFrame({"wallet": all_wallets})
+    totals["total_bought"] = totals["wallet"].map(bought_totals).fillna(0.0)
+    totals["total_sold"] = totals["wallet"].map(sold_totals).fillna(0.0)
+    totals["net_position"] = totals["total_bought"] - totals["total_sold"]
 
-        # FIFO match
-        lots = list(zip(buys["value_token"], buys["price"].fillna(0)))
+    # --- FIFO realized PnL ---
+    # Only wallets that sold at least once can have nonzero realized PnL —
+    # for a large accumulation-heavy token, most wallets never sell, so
+    # this alone can skip the vast majority of the wallet set. For the
+    # rest, split buys/sells into per-wallet groups ONCE (groupby is a
+    # single O(n log n) pass) instead of re-scanning the full transfer
+    # set for every wallet (which was the real O(wallets x transfers)
+    # bottleneck — the reason runs went from ~1 min to 10-30+ min once
+    # this function started actually running on tens of thousands of
+    # wallets instead of exiting early on empty price data).
+    sellers = sold_totals[sold_totals > 0].index
+    buy_groups = {w: g[["value_token", "price"]].values for w, g in df[df["to"].isin(sellers)].groupby("to")}
+    sell_groups = {w: g[["value_token", "price"]].values for w, g in df[df["from"].isin(sellers)].groupby("from")}
+
+    realized_map = {}
+    for w in sellers:
+        lots = buy_groups.get(w, [])
+        sells = sell_groups.get(w, [])
         realized = 0.0
         li = 0
-        remaining_qty, remaining_price = (lots[0] if lots else (0, 0))
-        for _, srow in sells.iterrows():
-            qty_to_sell = srow["value_token"]
-            sell_price = srow["price"] if not pd.isna(srow["price"]) else 0
+        remaining_qty, remaining_price = (lots[0][0], lots[0][1]) if len(lots) else (0, 0)
+        for sell_qty, sell_price in sells:
+            sell_price = 0 if pd.isna(sell_price) else sell_price
+            qty_to_sell = sell_qty
             while qty_to_sell > 0 and li < len(lots):
                 if remaining_qty <= 0:
                     li += 1
                     if li >= len(lots):
                         break
-                    remaining_qty, remaining_price = lots[li]
+                    remaining_qty, remaining_price = lots[li][0], lots[li][1]
                     continue
                 matched = min(qty_to_sell, remaining_qty)
                 realized += matched * (sell_price - remaining_price)
                 qty_to_sell -= matched
                 remaining_qty -= matched
+        realized_map[w] = realized
 
-        results.append({
-            "wallet": w,
-            "realized_pnl_usd": realized,
-            "total_bought": total_bought,
-            "total_sold": total_sold,
-            "net_position": total_bought - total_sold,
-        })
+    totals["realized_pnl_usd"] = totals["wallet"].map(realized_map).fillna(0.0)
 
-    # NOTE: pd.DataFrame([]) with an empty list produces a DataFrame with
-    # NO columns at all, which later breaks `pnl_df["wallet"]` / merges.
-    # Always pin the columns explicitly so downstream code sees a
-    # consistent (possibly 0-row) schema even when `wallets` is empty.
-    return pd.DataFrame(results, columns=PNL_COLUMNS)
+    # NOTE: pin the column order/schema explicitly (also handles the
+    # 0-wallet edge case cleanly) so downstream code sees a consistent
+    # shape regardless of dataset size.
+    if totals.empty:
+        return pd.DataFrame(columns=PNL_COLUMNS)
+    return totals[PNL_COLUMNS]
 
 
 def _funding_source(wallet: str, chain: str) -> str:
@@ -131,17 +144,18 @@ def _coordinated_and_fresh_flags(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["wallet", "flagged_coordinated", "flagged_fresh_big_buy"])
 
-    df = df.sort_values("datetime")
-    coordinated_wallets = set()
+    df = df.sort_values("datetime").copy()
+    df["bucket"] = df["datetime"].dt.floor(f"{settings.coordinated_window_minutes}min")
 
-    buys = df.copy()
-    buys["bucket"] = buys["datetime"].dt.floor(f"{settings.coordinated_window_minutes}min")
-    grouped = buys.groupby("bucket")["to"].nunique()
-    hot_buckets = grouped[grouped >= settings.coordinated_min_wallets].index
-    for b in hot_buckets:
-        coordinated_wallets.update(buys[buys["bucket"] == b]["to"].unique())
+    # Vectorized: compute each row's per-bucket unique-wallet count in one
+    # groupby().transform() pass, then select "hot" rows directly — avoids
+    # looping over every hot bucket and re-filtering the full dataframe
+    # each time (which, with a fine-grained time window over a long
+    # history, can mean tens of thousands of full-dataframe re-scans).
+    bucket_wallet_counts = df.groupby("bucket")["to"].transform("nunique")
+    coordinated_wallets = set(df.loc[bucket_wallet_counts >= settings.coordinated_min_wallets, "to"].unique())
 
-    first_buy_amount = df.sort_values("datetime").groupby("to").first()["value_token"]
+    first_buy_amount = df.groupby("to")["value_token"].first()
     fresh_big_buy = set(first_buy_amount[first_buy_amount >= settings.fresh_wallet_buy_threshold].index)
 
     return pd.DataFrame({
@@ -181,15 +195,29 @@ def run(df: pd.DataFrame, prices: pd.DataFrame, chain: str = "ethereum", **kwarg
             "in_funding_cluster", "cluster_size", "flagged_coordinated", "flagged_fresh_big_buy",
         ])
 
-    rows = []
     top_candidates = pnl_df.sort_values("net_position", ascending=False).head(
         settings.top_n_wallets_deep_analysis
     )["wallet"].tolist()
+    top_candidates_set = set(top_candidates)
 
+    # Build each top-candidate's buy history with ONE filter + groupby
+    # pass over the full transfer set, instead of re-scanning it once per
+    # wallet (42,000 wallets x 310,000 rows was the actual reason runs
+    # went from ~1 min to 10-30+ min once this scenario started genuinely
+    # processing large wallet counts).
+    top_buys_by_wallet = {
+        w: g for w, g in df_filtered[df_filtered["to"].isin(top_candidates_set)].groupby("to")
+    }
+
+    rows = []
     for w in pnl_df["wallet"]:
-        buys = df_filtered[df_filtered["to"] == w]
-        timing_score = _accumulation_timing_score(buys, prices) if w in top_candidates else 0.0
-        funding = _funding_source(w, chain) if w in top_candidates else "not_analyzed"
+        if w in top_candidates_set:
+            buys = top_buys_by_wallet.get(w, df_filtered.iloc[0:0])
+            timing_score = _accumulation_timing_score(buys, prices)
+            funding = _funding_source(w, chain)
+        else:
+            timing_score = 0.0
+            funding = "not_analyzed"
         rows.append({"wallet": w, "timing_score": timing_score, "funding_source": funding})
 
     # Same fix as _realized_pnl: pin columns so an empty `rows` list still
@@ -202,24 +230,29 @@ def run(df: pd.DataFrame, prices: pd.DataFrame, chain: str = "ethereum", **kwarg
     result["flagged_fresh_big_buy"] = result["flagged_fresh_big_buy"].fillna(False)
 
     # funding cluster size
-    cluster_sizes = result[result["funding_source"] != "unknown"].groupby("funding_source")["wallet"].transform("count")
+    cluster_sizes = result[~result["funding_source"].isin(["unknown", "not_analyzed"])].groupby("funding_source")["wallet"].transform("count")
     result["cluster_size"] = cluster_sizes.reindex(result.index).fillna(1)
     result["in_funding_cluster"] = result["cluster_size"] > 1
 
     # cross-token diversity: how many OTHER fetched tokens has this wallet touched
-    all_transfer_files = list(data_layer.DATA_RAW_DIR.glob("*_transfers.parquet"))
+    all_transfer_files = [
+        f for f in data_layer.DATA_RAW_DIR.glob("*_transfers.parquet")
+    ]
     diversity_counts = {}
     if len(all_transfer_files) > 1:
+        # Build each file's wallet-address set ONCE, then do O(1) set
+        # lookups per wallet — instead of re-scanning every other token's
+        # full transfer file for every single wallet (wallets x files x
+        # rows_per_file), which was extremely slow for large wallet counts.
+        wallet_sets_per_file = []
+        for f in all_transfer_files:
+            try:
+                other = pd.read_parquet(f, columns=["from", "to"])
+            except Exception:
+                continue
+            wallet_sets_per_file.append(set(other["from"]) | set(other["to"]))
         for w in result["wallet"]:
-            count = 0
-            for f in all_transfer_files:
-                try:
-                    other = pd.read_parquet(f, columns=["from", "to"])
-                except Exception:
-                    continue
-                if (other["to"] == w).any() or (other["from"] == w).any():
-                    count += 1
-            diversity_counts[w] = count
+            diversity_counts[w] = sum(1 for s in wallet_sets_per_file if w in s)
     result["distinct_tokens_traded"] = result["wallet"].map(diversity_counts).fillna(1)
 
     # normalize sub-scores 0-1 for scoring
