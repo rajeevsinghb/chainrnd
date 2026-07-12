@@ -348,17 +348,19 @@ def fetch_prices(
     platform = settings.coingecko_platform(chain)
 
     headers = {}
-    api_key = os.getenv("COINGECKO_API_KEY", "")
+    api_key = os.getenv("COINGECKO_API_KEY", "").strip()  # strip stray whitespace/newlines from secret paste
     if api_key:
-        # Demo-plan keys use this header; raises the rate limit from
-        # ~5-15 calls/min (keyless, IP-shared — easily exhausted on
-        # GitHub Actions runners, which share IPs across many users)
-        # to a stable 30 calls/min.
+        # Demo-plan keys accept the key via header OR query param. We send
+        # BOTH — some network layers (proxies, certain runners) can strip
+        # custom headers, and CoinGecko's own docs lead with the query-
+        # param form, so this is the most compatibility-safe approach.
         headers["x-cg-demo-api-key"] = api_key
 
     def _get(url, params):
         """GET with retry-with-backoff on 429 (rate limit) / 5xx.
         Returns the final response (may still be non-200)."""
+        if api_key:
+            params = {**params, "x_cg_demo_api_key": api_key}
         last_resp = None
         for attempt in range(4):
             resp = requests.get(url, params=params, headers=headers, timeout=30)
@@ -381,6 +383,10 @@ def fetch_prices(
 
     if resp is None or resp.status_code != 200:
         status = resp.status_code if resp is not None else "no response"
+        body = resp.text[:200] if resp is not None else ""
+        print(
+            f"[price-fetch] response body: {body}"
+        )
         print(
             f"[price-fetch] WARNING: contract-lookup failed for "
             f"{chain}/{contract} (HTTP {status}). "
